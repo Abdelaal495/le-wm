@@ -9,17 +9,20 @@ import stable_worldmodel as swm
 import torch
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
+import torch.nn.functional as F
 
-from module import SIGReg
+from module import SIGReg, StepwiseNormalizedDispersion
 from utils import get_column_normalizer, get_img_preprocessor, SaveCkptCallback
 
 
 def lejepa_forward(self, batch, stage, cfg):
-    """encode observations, predict next states, compute losses."""
+    """Encode observations, predict next states, compute losses."""
 
     ctx_len = cfg.history_size
     n_preds = cfg.num_preds
-    lambd = cfg.loss.sigreg.weight
+
+    reg_name = cfg.loss.name
+    lambd = cfg.loss[reg_name].weight if reg_name != "none" else 0.0
 
     # Replace NaN values with 0 (occurs at sequence boundaries)
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
@@ -30,18 +33,44 @@ def lejepa_forward(self, batch, stage, cfg):
     act_emb = output["act_emb"]
 
     ctx_emb = emb[:, :ctx_len]
-    ctx_act = act_emb[:, : ctx_len]
+    ctx_act = act_emb[:, :ctx_len]
 
-    tgt_emb = emb[:, n_preds:] # label
-    pred_emb = self.model.predict(ctx_emb, ctx_act) # pred
+    tgt_emb = emb[:, n_preds:]              # usually emb[:, 1:]
+    pred_emb = self.model.predict(ctx_emb, ctx_act)
 
-    # LeWM loss
+    # Main JEPA predictive loss
     output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
-    output["sigreg_loss"]= self.sigreg(emb.transpose(0, 1))
-    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]  
 
-    losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
-    self.log_dict(losses_dict, on_step=True, sync_dist=True)
+    # Anti-collapse regularizer
+    if reg_name == "none":
+        output["reg_loss"] = emb.new_tensor(0.0)
+    elif reg_name == "sigreg":
+        # Original LeWM behavior: SIGReg expects (T, B, D)
+        output["reg_loss"] = self.regularizer(emb.transpose(0, 1))
+    elif reg_name == "disp":
+        # New behavior: dispersion expects (B, T, D)
+        output["reg_loss"] = self.regularizer(emb)
+    else:
+        raise ValueError(f"Unknown regularizer: {reg_name}")
+
+    output["loss"] = output["pred_loss"] + lambd * output["reg_loss"]
+
+    # Extra diagnostics
+    with torch.no_grad():
+        output["emb_norm"] = emb.float().norm(dim=-1).mean()
+        z = F.normalize(emb.float(), dim=-1)
+        stepwise_cos = torch.einsum("btd,ctd->tbc", z, z)
+        B = emb.size(0)
+        eye = torch.eye(B, dtype=torch.bool, device=emb.device).unsqueeze(0)
+        output["mean_offdiag_cos"] = stepwise_cos.masked_select(~eye).mean()
+
+    logs = {
+        f"{stage}/{k}": v.detach()
+        for k, v in output.items()
+        if "loss" in k or k in ["emb_norm", "mean_offdiag_cos"]
+    }
+    self.log_dict(logs, on_step=True, sync_dist=True)
+
     return output
 
 @hydra.main(version_base=None, config_path="./config/train", config_name="lewm")
@@ -94,9 +123,18 @@ def run(cfg):
     }
 
     data_module = spt.data.DataModule(train=train, val=val)
+    if cfg.loss.name == "sigreg":
+        regularizer = SIGReg(**cfg.loss.sigreg.kwargs)
+    elif cfg.loss.name == "disp":
+        regularizer = StepwiseNormalizedDispersion(**cfg.loss.disp.kwargs)
+    elif cfg.loss.name == "none":
+        regularizer = torch.nn.Identity()
+    else:
+        raise ValueError(f"Unknown regularizer: {cfg.loss.name}")
+    
     world_model = spt.Module(
-        model = world_model,
-        sigreg = SIGReg(**cfg.loss.sigreg.kwargs),
+        model=world_model,
+        regularizer=regularizer,
         forward=partial(lejepa_forward, cfg=cfg),
         optim=optimizers,
     )
