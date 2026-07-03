@@ -36,8 +36,21 @@ optimizer:
 num_preds: 1
 
 loss:
+  name: sigreg
+
   sigreg:
     weight: 0.09
     kwargs:
       knots: 17
       num_proj: 1024
+
+  disp:
+    weight: 0.03
+    kwargs:
+      tau: 0.5
+      normalize: true
+      exclude_self: true
+      eps: 1e-8
+
+  none:
+    weight: 0.0
