@@ -1,3 +1,4 @@
+import math
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -34,7 +35,71 @@ class SIGReg(torch.nn.Module):
         err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square()
         statistic = (err @ self.weights) * proj.size(-2)
         return statistic.mean() # average over projections and time
-    
+
+class StepwiseNormalizedDispersion(torch.nn.Module):
+    """
+    Step-wise positive-free dispersion regularizer.
+
+    emb: (B, T, D)
+
+    For each time step t, treats different batch elements as negatives:
+        negatives for z[b, t] are z[b', t] where b' != b.
+
+    The latents are normalized inside the regularizer only.
+    The model's raw latent space is still used for prediction and planning.
+    """
+
+    def __init__(self, tau=0.5, normalize=True, exclude_self=True, eps=1e-8):
+        super().__init__()
+        self.tau = tau
+        self.normalize = normalize
+        self.exclude_self = exclude_self
+        self.eps = eps
+
+    def forward(self, emb):
+        """
+        emb: (B, T, D)
+        """
+        if emb.ndim != 3:
+            raise ValueError(f"Expected emb with shape (B, T, D), got {emb.shape}")
+
+        B, T, D = emb.shape
+
+        if B < 2:
+            raise ValueError("StepwiseNormalizedDispersion needs batch size >= 2")
+
+        # Use fp32 for numerical stability, especially under bf16 training.
+        z = emb.float()
+
+        if self.normalize:
+            z = F.normalize(z, dim=-1, eps=self.eps)
+
+        # Work step-wise: (T, B, D)
+        z = z.transpose(0, 1)
+
+        # Pairwise squared distances at each time step: (T, B, B)
+        # For normalized z, ||zi - zj||^2 = 2 - 2 cos(zi, zj).
+        sim = torch.einsum("tbd,tcd->tbc", z, z)
+
+        if self.normalize:
+            dist2 = (2.0 - 2.0 * sim).clamp_min(0.0)
+        else:
+            sq = z.pow(2).sum(dim=-1)
+            dist2 = (sq[:, :, None] + sq[:, None, :] - 2.0 * sim).clamp_min(0.0)
+
+        logits = -dist2 / self.tau
+
+        if self.exclude_self:
+            eye = torch.eye(B, dtype=torch.bool, device=emb.device).unsqueeze(0)
+            logits = logits.masked_fill(eye, -torch.inf)
+            num_pairs = B * (B - 1)
+        else:
+            num_pairs = B * B
+
+        # log mean exp(-dist/tau), averaged over time.
+        loss_t = torch.logsumexp(logits.reshape(T, -1), dim=-1) - math.log(num_pairs)
+        return loss_t.mean()
+        
 class FeedForward(nn.Module):
     """FeedForward network used in Transformers"""
 
